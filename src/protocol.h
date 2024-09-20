@@ -52,35 +52,40 @@ typedef struct {
 
 
 
+//https://github.com/msgpack/msgpack-c/wiki/v2_0_cpp_packer
 //implement pack for ipcHandler
-namespace msgpack {
-MSGPACK_API_VERSION_NAMESPACE(MSGPACK_DEFAULT_API_NS) {
-namespace adaptor {
+// 定义一个宏来生成msgpack的适配器模板
+#define DEFINE_MSGPACK_FIXSIZE_ADAPTER(type_name) \
+namespace msgpack { \
+MSGPACK_API_VERSION_NAMESPACE(MSGPACK_DEFAULT_API_NS) { \
+namespace adaptor { \
+\
+template <> \
+struct pack<type_name> { \
+    template <typename Stream> \
+    packer<Stream>& operator()(msgpack::packer<Stream>& o, const type_name& v) const { \
+        o.pack_bin(sizeof(type_name)); \
+        o.pack_bin_body(reinterpret_cast<const char*>(&v), sizeof(type_name)); \
+        return o; \
+    } \
+}; \
+\
+template <> \
+struct convert<type_name> { \
+    msgpack::object const& operator()(msgpack::object const& o, type_name& v) const { \
+        if (o.type != msgpack::type::BIN || o.via.bin.size != sizeof(type_name)) { \
+            throw msgpack::type_error(); \
+        } \
+        std::memcpy(&v, o.via.bin.ptr, sizeof(type_name)); \
+        return o; \
+    } \
+}; \
+\
+} /* namespace adaptor */ \
+} /* MSGPACK_API_VERSION_NAMESPACE(MSGPACK_DEFAULT_API_NS) */ \
+} /* namespace msgpack */
 
-template <>
-struct pack<cudaIpcMemHandle_t> {
-    template <typename Stream>
-    packer<Stream>& operator()(msgpack::packer<Stream>& o, const cudaIpcMemHandle_t& v) const {
-        o.pack_bin(sizeof(cudaIpcMemHandle_t));
-        o.pack_bin_body(reinterpret_cast<const char*>(&v), sizeof(cudaIpcMemHandle_t));
-        return o;
-    }
-};
-
-template <>
-struct convert<cudaIpcMemHandle_t> {
-    msgpack::object const& operator()(msgpack::object const& o, cudaIpcMemHandle_t& v) const {
-        if (o.type != msgpack::type::BIN || o.via.bin.size != sizeof(cudaIpcMemHandle_t)) {
-            throw msgpack::type_error();
-        }
-        std::memcpy(&v, o.via.bin.ptr, sizeof(cudaIpcMemHandle_t));
-        return o;
-    }
-};
-
-} // namespace adaptor
-} // MSGPACK_API_VERSION_NAMESPACE(MSGPACK_DEFAULT_API_NS)
-} 
+DEFINE_MSGPACK_FIXSIZE_ADAPTER(cudaIpcMemHandle_t)
 
 typedef struct {
     cudaIpcMemHandle_t ipc_handle;
@@ -91,7 +96,12 @@ typedef struct {
 } local_meta_t;
 
 
-// Update function declarations
+typedef struct {
+    uint64_t addr;
+    uint32_t rkey;
+    uint32_t size;
+} remote_meta_t;
+
 bool serialize_local_meta(const local_meta_t& meta, std::string& out);
 bool deserialize_local_meta(const char* data, size_t size, local_meta_t& out);
 

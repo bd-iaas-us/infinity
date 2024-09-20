@@ -1,6 +1,5 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <gdrapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +68,48 @@ int sync_local(connection_t *conn) {
     return 0;
 }
 
+
+int rw_remote(connection_t *conn) {
+    void * buffer = cudaMemAlloc(1024);
+    if (buffer == NULL) {
+        fprintf(stderr, "Failed to allocate buffer\n");
+        return -1;
+    }
+    // 获取IB设备列表
+    int num_devices;
+    struct ibv_device** device_list = ibv_get_device_list(&num_devices);
+    if (!device_list) {
+        perror("Failed to get IB devices list");
+        return -1;
+    }
+
+    // 使用第一个可用的设备
+    context = ibv_open_device(device_list[0]);
+    if (!context) {
+        perror("Failed to open IB device");
+        ibv_free_device_list(device_list);
+        return -1;
+    }
+
+    ibv_free_device_list(device_list);
+
+    // 分配保护域
+    pd = ibv_alloc_pd(context);
+    if (!pd) {
+        perror("Failed to allocate PD");
+        return -1;
+    }
+
+    // 注册内存区域
+    mr = ibv_reg_mr(pd, buffer, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ);
+    if (!mr) {
+        perror("Failed to register MR");
+        return -1;
+    }
+
+    return 0;
+
+}
 
 int rw_local(connection_t *conn, char op, const std::vector<block_t>& blocks, int block_size, void *ptr) {
     assert(conn != NULL);

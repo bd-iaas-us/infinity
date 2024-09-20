@@ -7,7 +7,6 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <gdrapi.h>
 #include <time.h>
 #include <assert.h>
 
@@ -59,8 +58,7 @@ struct Client {
     bool cuda_sync_inflight;
     //send cudaSyncStream to workqueue 
     uv_work_t work_req;
-    //where to save cudaSyncStream's result
-    //int return_code;
+    
     Client() = default;
     Client(const Client&) = delete;
     ~Client();
