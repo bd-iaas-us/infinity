@@ -5,7 +5,8 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 // give me some color see see
-static auto console = spdlog::stdout_color_mt("infinity");
+
+#define APP_NAME "infinity"
 
 #define DEBUG(fmt, ...) \
         do { spdlog::get("infinity")->debug(fmt, ##__VA_ARGS__); } while (0)

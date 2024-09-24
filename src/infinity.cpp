@@ -33,11 +33,7 @@ int get_kvmap_len() {
 }
 
 void print_header(header_t *header) {
-    printf("op: %c\n", header->op);
-    if (header->op == OP_SYNC) {
-       return;
-    }
-    printf("body_size: %d\n", header->body_size);
+    INFO("HEADER: op: {0}, body_size :{1}", header->op, header->body_size);
 }
 
 typedef enum {
@@ -60,7 +56,6 @@ struct Client {
     char send_buffer[RETURN_CODE_SIZE]; //preallocated buffer for sending return code
 
     cudaStream_t cuda_stream;
-    int device_id;
     bool cuda_operation_inflight;
     //Use this flag to avoid multiple threads waiting for the same stream
     bool cuda_sync_inflight;
@@ -82,7 +77,10 @@ Client::~Client() {
         free(recv_buffer);
         recv_buffer = NULL;
     }
-    //TODO: destroy cuda stream
+    if (cuda_operation_inflight) {
+        cudaStreamDestroy(cuda_stream);
+        INFO("destroy cuda stream");
+    }
 }
 typedef struct Client client_t;
 
@@ -104,7 +102,7 @@ void reset_client_read_state(client_t *client) {
 }
 
 void on_close(uv_handle_t* handle) {
-    printf("free client...\n");
+    INFO("free client...");
     client_t *client = (client_t *) handle->data;
     delete client;
 }
@@ -140,10 +138,6 @@ int do_read_kvcache(client_t *client) {
 
     assert(header != NULL);
 
-    //TODO: check device_id
-    client->device_id = client->local_meta.device_id;
-    cudaSetDevice(client->device_id);
-
     //create cuda stream if not exist
     if (!client->cuda_operation_inflight) {
         cudaStream_t cuda_stream;
@@ -152,8 +146,9 @@ int do_read_kvcache(client_t *client) {
     }
 
     //TODO: check device_id
-    CHECK_CUDA(cudaIpcOpenMemHandle(&d_ptr, meta->ipc_handle, cudaIpcMemLazyEnablePeerAccess));
 
+
+    CHECK_CUDA(cudaIpcOpenMemHandle(&d_ptr, meta->ipc_handle, cudaIpcMemLazyEnablePeerAccess));
 
     for (auto &block : meta->blocks) {
         //find the key in the map
@@ -163,15 +158,19 @@ int do_read_kvcache(client_t *client) {
             CHECK_CUDA(cudaIpcCloseMemHandle(d_ptr));
             return KEY_NOT_FOUND;
         }
+
         //key found
         //std::cout << "Key found: " << block.key << std::endl;
         void * h_src = kv_map[block.key];
         //push the host cpu data to local device
         CHECK_CUDA(cudaMemcpyAsync((char*)d_ptr + block.offset, h_src, meta->block_size, cudaMemcpyHostToDevice, client->cuda_stream));
+        
+    
         client->cuda_operation_inflight = true;
     }
+    cudaStreamSynchronize(client->cuda_stream);
     CHECK_CUDA(cudaIpcCloseMemHandle(d_ptr));
-
+    CHECK_CUDA(cudaFree(d_ptr));
 
     return TASK_ACCEPTED;
 }
@@ -179,14 +178,10 @@ int do_read_kvcache(client_t *client) {
 
 
 int do_write_kvcache(client_t *client) {
-
     const local_meta_t * meta =  &client->local_meta;
     assert(meta != NULL);
     // allocate host memory
     void* d_ptr;
-
-    client->device_id = client->local_meta.device_id;
-    cudaSetDevice(client->device_id);
 
     CHECK_CUDA(cudaIpcOpenMemHandle(&d_ptr, meta->ipc_handle, cudaIpcMemLazyEnablePeerAccess));
     
@@ -204,8 +199,8 @@ int do_write_kvcache(client_t *client) {
     for (auto &block : meta->blocks) {
         //pull data from local device to CPU host
         void * h_dst;
-        CHECK_CUDA(cudaHostAlloc((void**)&h_dst, meta->block_size, cudaHostAllocPortable));
-
+        //CHECK_CUDA(cudaHostAlloc((void**)&h_dst, meta->block_size, cudaHostAllocDefault));
+        h_dst = malloc(meta->block_size);
         if (h_dst == NULL) {
             perror("Failed to allocat host memroy");
             CHECK_CUDA(cudaIpcCloseMemHandle(d_ptr));
@@ -214,7 +209,6 @@ int do_write_kvcache(client_t *client) {
         //how to deal with memory overflow? 
         //pull data from local device to CPU host
         CHECK_CUDA(cudaMemcpyAsync(h_dst, (char*)d_ptr + block.offset, meta->block_size, cudaMemcpyDeviceToHost, client->cuda_stream));
-
 
         client->cuda_operation_inflight = true;
 
@@ -231,9 +225,8 @@ void wait_for_cuda_completion(uv_work_t *req) {
     client_t *client = (client_t *)req->data;
     // Wait for the CUDA stream to complete
     // Sets device as the current device for the calling host thread
-    cudaSetDevice(client->device_id);
     CHECK_CUDA(cudaStreamSynchronize(client->cuda_stream));
-    printf("sync on stream %d done\n", client->cuda_stream);
+    INFO("wait for cuda completion on stream {}, on device {}", (unsigned long)client->cuda_stream);
 }
 
 void after_cuda_completion(uv_work_t *req, int status) {
@@ -247,6 +240,8 @@ void after_cuda_completion(uv_work_t *req, int status) {
     uv_buf_t wbuf = uv_buf_init(client->send_buffer, RETURN_CODE_SIZE);
     uv_write(write_req, (uv_stream_t *)client->handle, &wbuf, 1, on_write);
 
+    //destory the stream
+    CHECK_CUDA(cudaStreamDestroy(client->cuda_stream));
     client->cuda_operation_inflight = false;
     client->cuda_sync_inflight = false;
     // Reset client state
@@ -264,6 +259,7 @@ int do_sync_stream(client_t *client) {
         client->cuda_sync_inflight = true;
         uv_queue_work(loop, &client->work_req, wait_for_cuda_completion, after_cuda_completion);
         //sync stream will handle return code by itself
+
         return 0;
     }
     return FINISH;
@@ -314,7 +310,6 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
     client_t* client = (client_t*)stream->data;
     ssize_t offset = 0;
 
-    int ret;
     if (nread < 0) {
         if (nread != UV_EOF)
             fprintf(stderr, "Read error %s\n", uv_err_name(nread));

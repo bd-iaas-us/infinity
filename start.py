@@ -11,6 +11,7 @@ app = FastAPI()
 
 @app.get("/status")
 async def status():
+    print("HELLO,WORLD")
     return {"Hello": "World"}
 
 @app.get("/kvmapSize")

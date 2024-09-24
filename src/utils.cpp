@@ -5,6 +5,11 @@
 #include <errno.h>
 #include <stdio.h>
 #include <iostream>
+#include <sstream>
+#include "log.h"
+#include <iomanip>
+
+
 
 
 
@@ -35,13 +40,13 @@ int recv_exact(int socket, void *buffer, size_t length) {
     return 0; // Successfully received exactly `length` bytes
 }
 
-//print the ipc handle, for debug
+
 void print_ipc_handle(cudaIpcMemHandle_t ipc_handle) {
-    printf("ipc_handle content:\n");
+    std::ostringstream oss;
     for (int i = 0; i < sizeof(cudaIpcMemHandle_t); i++) {
-	    printf("%02x ", ((unsigned char*)&ipc_handle)[i]);
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)((unsigned char*)&ipc_handle)[i] << " ";
     }
-    printf("\n");
+    INFO("ipc_handle content: {}", oss.str().c_str());
 }
 
 void compare_ipc_handle(cudaIpcMemHandle_t ipc_handle1, cudaIpcMemHandle_t ipc_handle2) {
@@ -49,7 +54,7 @@ void compare_ipc_handle(cudaIpcMemHandle_t ipc_handle1, cudaIpcMemHandle_t ipc_h
         unsigned char d1 = ((unsigned char*)&ipc_handle1)[i];
         unsigned char d2 = ((unsigned char*)&ipc_handle2)[i];
         if (d1 != d2) {
-            printf("ipc_handle1 is not equal to ipc_handle2\n");
+            INFO("ipc_handle1 is not equal to ipc_handle2\n");
             return;
         }
     }
