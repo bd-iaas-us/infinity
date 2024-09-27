@@ -127,6 +127,60 @@ int modify_qp_to_init(struct ibv_qp *qp) {
 
 
 
+int perform_rdma_read(connection_t *conn, uintptr_t src_buf, size_t src_size,
+                      char * dst_buf, size_t dst_size, uint32_t rkey) {
+
+    //FIXME
+    conn->mr = ibv_reg_mr(conn->pd, dst_buf, dst_size,
+                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!conn->mr) {
+        perror("Failed to register MR");
+        return -1;
+    }
+
+    // Prepare RDMA read operation
+    struct ibv_sge sge = {};
+    sge.addr = (uintptr_t)dst_buf;
+    sge.length = dst_size;
+    sge.lkey = conn->mr->lkey;
+
+    struct ibv_send_wr wr = {};
+    wr.wr_id = (uintptr_t)conn;
+    wr.opcode = IBV_WR_RDMA_READ;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = src_buf; // Obtain from server
+    wr.wr.rdma.rkey = rkey;        // Obtain from server
+
+    struct ibv_send_wr *bad_wr = NULL;
+    int ret = ibv_post_send(conn->qp, &wr, &bad_wr);
+    if (ret) {
+        perror("Failed to post RDMA read");
+        return -1;
+    }
+
+    // Poll for completion
+    struct ibv_wc wc;
+    int num_comp;
+    do {
+        num_comp = ibv_poll_cq(conn->cq, 1, &wc);
+    } while (num_comp == 0);
+
+    if (num_comp < 0) {
+        perror("Failed to poll CQ");
+        return -1;
+    }
+
+    if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "RDMA read failed: %s\n", ibv_wc_status_str(wc.status));
+        return -1;
+    }
+    printf("RDMA read completed successfully\n");
+    // RDMA read successful
+    return 0;
+}
+
 int perform_rdma_write(connection_t *conn, char * src_buf, size_t src_size,
                        uintptr_t dst_buf, size_t dst_size, uint32_t rkey) {
     conn->mr = ibv_reg_mr(conn->pd, src_buf, src_size,
@@ -335,8 +389,13 @@ int sync_local(connection_t *conn) {
 }
 
 //FIXME: implement this function
+//should be
+//rw_remote(connection_t *conn, char op, const std::vector<std::string>keys, std::vector<int> offsets, int block_size, void * ptr)
+//这样ptr只需要注册一次
 int rw_remote(connection_t *conn, char op, const std::vector<std::string>keys, int block_size, void * ptr) {
     assert(conn != NULL);
+    assert(op == OP_RDMA_READ || op == OP_RDMA_WRITE);
+    assert(ptr != NULL);
 
     remote_meta_request request = {
         .keys = keys,
@@ -350,7 +409,7 @@ int rw_remote(connection_t *conn, char op, const std::vector<std::string>keys, i
 
     header_t header = {
         .magic = MAGIC,
-        .op = OP_RDMA_WRITE,
+        .op = op,
         .body_size = static_cast<unsigned int>(serialized_data.size()),
     };
 
@@ -370,7 +429,6 @@ int rw_remote(connection_t *conn, char op, const std::vector<std::string>keys, i
         perror("Failed to receive return size");
         return -1;
     }
-    printf("return size: %d\n", return_size);
     char response_data[return_size];
     if(recv(conn->sock, &response_data, return_size, MSG_WAITALL) < 0 ) {
         perror("Failed to receive response data");
@@ -384,7 +442,14 @@ int rw_remote(connection_t *conn, char op, const std::vector<std::string>keys, i
     printf("remote meta response: %llu, rkey: %d\n", response.blocks[0].remote_addr, response.blocks[0].rkey);
 
     for (auto &block : response.blocks) {
-        perform_rdma_write(conn, (char *)ptr, block_size, block.remote_addr, block_size, block.rkey);
+        if (op == OP_RDMA_WRITE) {
+            perform_rdma_write(conn, (char *)ptr, block_size, block.remote_addr, block_size, block.rkey);
+        } else if (op == OP_RDMA_READ) {
+            perform_rdma_read(conn, block.remote_addr, block_size, (char *)ptr, block_size, block.rkey);
+        } else {
+            fprintf(stderr, "Invalid operation\n");
+            return -1;
+        }
     }
 
     return 0;

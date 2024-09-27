@@ -1,5 +1,3 @@
-
-
 from infinity import _infinity
 
 import torch
@@ -32,6 +30,10 @@ class DisableTorchCaching:
 class InfinityConnection:
     OP_R="R"
     OP_W="W"
+    OP_SYNC="S"
+    OP_RDMA_EXCHANGE="E"
+    OP_RDMA_WRITE="D"
+    OP_RDMA_READ="A"
     def __init__(self):
         self.conn = _infinity.Connection()
         self.connected = False

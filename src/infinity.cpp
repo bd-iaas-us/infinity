@@ -7,7 +7,6 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
-#include <gdrapi.h>
 #include <time.h>
 #include <assert.h>
 
@@ -29,14 +28,21 @@ uv_loop_t *loop;
 uv_tcp_t server;
 #define BUFFER_SIZE (64<<10)
 
-std::map<std::string, void*> kv_map;
+
+struct PTR {
+    void *ptr;
+    size_t size;
+    struct ibv_mr *mr;
+};
+
+std::map<std::string, PTR> kv_map;
 
 int get_kvmap_len() {
     return kv_map.size();
 }
 
 void print_header(header_t *header) {
-    INFO("HEADER: op: {0}, body_size :{1}", header->op, header->body_size);
+    INFO("HEADER: op: {}, body_size :{}", header->op, header->body_size);
 }
 
 typedef enum {
@@ -66,7 +72,6 @@ struct Client {
     bool cuda_sync_inflight;
     //send cudaSyncStream to workqueue 
     uv_work_t work_req;
-    //where to save cudaSyncStream's result
 
     rdma_conn_info_t remote_info;
     rdma_conn_info_t local_info;
@@ -75,10 +80,9 @@ struct Client {
     struct ibv_pd *pd;
     struct ibv_cq *cq;
     struct ibv_qp *qp;
-    struct ibv_mr *mr;
+
     int gidx; //gid index
-    char * rdma_buffer;
-    size_t rdma_buffer_size;
+
 
     Client() = default;
     Client(const Client&) = delete;
@@ -179,7 +183,10 @@ int do_read_kvcache(client_t *client) {
 
         //key found
         //std::cout << "Key found: " << block.key << std::endl;
-        void * h_src = kv_map[block.key];
+        void * h_src = kv_map[block.key].ptr;
+        if (h_src == NULL) {
+            return KEY_NOT_FOUND;
+        }
         //push the host cpu data to local device
         CHECK_CUDA(cudaMemcpyAsync((char*)d_ptr + block.offset, h_src, meta->block_size, cudaMemcpyHostToDevice, client->cuda_stream));
         
@@ -228,7 +235,11 @@ int do_write_kvcache(client_t *client) {
         client->cuda_operation_inflight = true;
 
         print_vector((float*)h_dst,10);
-        kv_map[block.key] = h_dst;
+        kv_map[block.key] = {
+            .ptr = h_dst,
+            .size = meta->block_size,
+            .mr = NULL,
+        };
     }
     CHECK_CUDA(cudaIpcCloseMemHandle(d_ptr));
     return TASK_ACCEPTED;
@@ -442,13 +453,48 @@ int do_sync_stream(client_t *client) {
 
 
 int do_rdma_read(client_t *client) {
-    INFO("do rdma read...");
-    return FINISH;
+    INFO("do rdma readkeys: {}", client->remote_meta_req.keys[0]);
+    //search the key in the map
+    if (kv_map.find(client->remote_meta_req.keys[0]) == kv_map.end()) {
+        //key not found
+        return KEY_NOT_FOUND;
+    }
+    PTR ptr = kv_map[client->remote_meta_req.keys[0]];
+    if (ptr.mr == NULL) {
+        //create mr if not exist
+        ptr.mr = ibv_reg_mr(client->pd, ptr.ptr, ptr.size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    }
+
+    //send the response
+    uv_write_t* write_req = (uv_write_t*)malloc(sizeof(uv_write_t));
+    remote_meta_response resp;
+    resp.blocks.push_back({
+        .rkey = ptr.mr->rkey,
+        .remote_addr = (uintptr_t)ptr.ptr
+    });
+
+    std::string out;
+    if (!serialize(resp, out)) {
+        perror("Failed to serialize response");
+        return SYSTEM_ERROR;
+    }
+    client->send_buffer = (char*) realloc(client->send_buffer, out.size() + RETURN_CODE_SIZE);
+
+    int size = out.size();
+    memcpy(client->send_buffer, &size, RETURN_CODE_SIZE);
+    memcpy(client->send_buffer + RETURN_CODE_SIZE, out.c_str(), out.size());
+    uv_buf_t wbuf = uv_buf_init(client->send_buffer, out.size() + RETURN_CODE_SIZE);
+    write_req->data = client;
+    uv_write(write_req, (uv_stream_t*)client->handle, &wbuf, 1, on_write);
+
+    INFO("send response: size:{}", size);
+    reset_client_read_state(client);
+    return 0;
 }
 
 int do_rdma_write(client_t *client) {
-    INFO("do rdma write...");
-    INFO("keys: {}", client->remote_meta_req.keys[0]);
+    INFO("do rdma write keys: {}", client->remote_meta_req.keys[0]);
+
     void * h_dst = malloc(client->remote_meta_req.block_size);
     int ret;
     if (h_dst == NULL) {
@@ -456,15 +502,26 @@ int do_rdma_write(client_t *client) {
         return SYSTEM_ERROR;
     }
     //save to the map
-    kv_map[client->remote_meta_req.keys[0]] = h_dst;
+    kv_map[client->remote_meta_req.keys[0]] = {
+        .ptr = h_dst,
+        .size = client->remote_meta_req.block_size
+    };
+    
     //
 
-    client->mr = ibv_reg_mr(client->pd, h_dst, client->remote_meta_req.block_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
+    struct ibv_mr* mr = ibv_reg_mr(client->pd, h_dst, client->remote_meta_req.block_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
 
-    if (!client->mr) {
+    if (!mr) {
         perror("Failed to register MR");
         return SYSTEM_ERROR;
     }
+    //save to the map
+    //FIXME: only one key is sent
+    kv_map[client->remote_meta_req.keys[0]] = {
+        .ptr = h_dst,
+        .size = client->remote_meta_req.block_size,
+        .mr = mr
+    };
 
     //send the response
     uv_write_t* write_req = (uv_write_t*)malloc(sizeof(uv_write_t));
@@ -472,9 +529,9 @@ int do_rdma_write(client_t *client) {
     
     remote_meta_response resp;
     //FIXME: only one h_dst is sent
-    INFO("create buffer rkey: {}, remote_addr: {}", client->mr->rkey, (uintptr_t)h_dst);
+    INFO("create buffer rkey: {}, remote_addr: {}", mr->rkey, (uintptr_t)h_dst);
     resp.blocks.push_back({
-        .rkey = client->mr->rkey,
+        .rkey = mr->rkey,
         .remote_addr = (uintptr_t)h_dst
     });
 
@@ -484,7 +541,8 @@ int do_rdma_write(client_t *client) {
         return SYSTEM_ERROR;
     }
     client->send_buffer = (char*) realloc(client->send_buffer, out.size() + RETURN_CODE_SIZE);
-    //FIXME: too many memcpy
+
+
     int size = out.size();
     memcpy(client->send_buffer, &size, RETURN_CODE_SIZE);
     memcpy(client->send_buffer + RETURN_CODE_SIZE, out.c_str(), out.size());
@@ -628,6 +686,7 @@ void on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
                             INFO("!!RDMA exchange done!!");
                             break;
                         case OP_RDMA_WRITE:
+                        case OP_RDMA_READ:
                             if (!deserialize(client->recv_buffer, client->expected_bytes, client->remote_meta_req)){
                                 printf("failed to deserialize remote meta\n");
                                 uv_close((uv_handle_t*)stream, on_close);
