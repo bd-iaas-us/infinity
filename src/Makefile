@@ -1,5 +1,8 @@
 CXX = g++
-CXXFLAGS = -std=c++11 -Wall -g
+CXXFLAGS = -std=c++11 -Wall
+DEBUG_FLAGS = -g -fsanitize=address -O0
+RELEASE_FLAGS = -O3
+
 
 INCLUDES = -I/usr/local/cuda/include
 LDFLAGS = -L/usr/local/cuda/lib64
@@ -12,7 +15,14 @@ PYBIND_TARGET= _infinity$(PYTHON_EXTENSION_SUFFIX)
 SOURCES := $(wildcard *.cpp)
 OBJECTS = $(SOURCES:.cpp=.o)
 
-all: infinity_server $(PYBIND_TARGET)
+all: debug
+
+debug: CXXFLAGS += $(DEBUG_FLAGS)
+debug: $(PYBIND_TARGET) infinity_server
+
+release: CXXFLAGS += $(RELEASE_FLAGS)
+release: $(PYBIND_TARGET) infinity_server
+
 
 -include $(OBJECTS:.o=.d)
 %.o: %.cpp
