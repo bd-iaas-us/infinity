@@ -544,15 +544,12 @@ int do_rdma_write(client_t *client) {
             goto RETURN;
         }
         //save to the map
-        INFO("HERE??");
         kv_map[key] = {
             .ptr = h_dst,
             .size = client->remote_meta_req.block_size
         };
-        INFO("before");
         struct ibv_mr* mr = ibv_reg_mr(client->pd, h_dst, client->remote_meta_req.block_size, 
                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-        INFO("after");
         if (!mr) {
             perror("Failed to register MR");
             error_code = SYSTEM_ERROR;
