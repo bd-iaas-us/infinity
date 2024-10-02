@@ -13,6 +13,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: Jimver/cuda-toolkit@v0.2.17
+      id: cuda-toolkit
+      with:
+        cuda: '12.2'  
     - name: make
       run: cd src; make
 
