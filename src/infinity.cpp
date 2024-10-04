@@ -165,7 +165,6 @@ void wait_for_ipc_close_completion(uv_work_t* req) {
 }
 
 void after_ipc_close_completion(uv_work_t* req, int status) {
-    ERROR("after_ipc_close_comp");
     wqueue_data_t *wqueue_data = (wqueue_data_t *)req->data;
     wqueue_data->client->remain--;
     INFO("after_ipc_close_completion done");

@@ -132,7 +132,7 @@ int init_rdma_resources(connection_t *conn) {
     conn->local_info.qpn = conn->qp->qp_num;
     conn->local_info.psn = lrand48() & 0xffffff;
     conn->local_info.gid = gid;
-    DEBUG("gid index: %d", gidx);
+    DEBUG("gid index: {}", gidx);
     print_rdma_conn_info(&conn->local_info, false);
     print_rdma_conn_info(&conn->remote_info, true);
     return 0;
@@ -157,17 +157,14 @@ int modify_qp_to_init(struct ibv_qp *qp) {
 }
 
 
-
 int perform_rdma_read(connection_t *conn, uintptr_t src_buf, size_t src_size,
-                      char * dst_buf, size_t dst_size, uint32_t rkey, struct ibv_mr *mr) {
+                      char * dst_buf, size_t dst_size, uint32_t rkey, uint32_t lkey) {
     
-    assert(mr != NULL);
-
     // Prepare RDMA read operation
     struct ibv_sge sge = {};
     sge.addr = (uintptr_t)dst_buf;
     sge.length = dst_size;
-    sge.lkey = mr->lkey;
+    sge.lkey = lkey;
 
     struct ibv_send_wr wr = {};
     wr.wr_id = (uintptr_t)conn;
@@ -198,7 +195,7 @@ int sync_rdma(connection_t *conn) {
     int total_completions = conn->rdma_write_count + conn->rdma_read_count;
     int num_completions = 0;
 
-    DEBUG("Waiting for %d completions", total_completions);
+    DEBUG("Waiting for {} completions", total_completions);
     while (num_completions < total_completions) {
         int waiting_completions = MIN(32, total_completions - num_completions);
         int ne = ibv_poll_cq(conn->cq, waiting_completions, wc);
@@ -223,15 +220,14 @@ int sync_rdma(connection_t *conn) {
 
 
 int perform_rdma_write(connection_t *conn, char * src_buf, size_t src_size,
-                       uintptr_t dst_buf, size_t dst_size, uint32_t rkey, struct ibv_mr *mr) {
+                       uintptr_t dst_buf, size_t dst_size, uint32_t rkey, uint32_t lkey) {
 
-    assert(mr != NULL);
 
     // Prepare RDMA write operation
     struct ibv_sge sge = {};
     sge.addr = (uintptr_t)src_buf;
     sge.length = src_size; 
-    sge.lkey = mr->lkey;
+    sge.lkey = lkey;
 
     struct ibv_send_wr wr = {};
     wr.wr_id = (uintptr_t)conn;
@@ -465,23 +461,24 @@ int rw_rdma(connection_t *conn, char op, const std::vector<block_t>& blocks, int
 
     struct ibv_mr *mr = NULL;
     if (conn->local_mr.find((uintptr_t)ptr) == conn->local_mr.end()) {
-        struct ibv_mr *mr = ibv_reg_mr(conn->pd, ptr, block_size * blocks.size(),
+        mr = ibv_reg_mr(conn->pd, ptr, block_size * blocks.size(),
                                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
         if (!mr) {
             ERROR("Failed to register MR");
             return -1;
         }
         conn->local_mr[(uintptr_t)ptr] = mr;
+    } else {
+        mr = conn->local_mr[(uintptr_t)ptr];
     }
-    mr = conn->local_mr[(uintptr_t)ptr];
 
     for (int i = 0; i < response.blocks.size(); i++) {
-        DEBUG("remote response: addr: {}, rkey: {}", response.blocks[i].remote_addr, response.blocks[i].rkey);
+        DEBUG("remote response: addr: {}, rkey: {}, lkey : {}", response.blocks[i].remote_addr, response.blocks[i].rkey, mr->lkey);
         int ret;
         if (op == OP_RDMA_WRITE) {
-            ret = perform_rdma_write(conn, (char *)ptr + blocks[i].offset, block_size, response.blocks[i].remote_addr, block_size, response.blocks[i].rkey, mr);
+            ret = perform_rdma_write(conn, (char *)ptr + blocks[i].offset, block_size, response.blocks[i].remote_addr, block_size, response.blocks[i].rkey, mr->lkey);
         } else if (op == OP_RDMA_READ) {
-            ret = perform_rdma_read(conn, response.blocks[i].remote_addr, block_size, (char *)ptr + blocks[i].offset, block_size, response.blocks[i].rkey, mr);
+            ret = perform_rdma_read(conn, response.blocks[i].remote_addr, block_size, (char *)ptr + blocks[i].offset, block_size, response.blocks[i].rkey, mr->lkey);
         } else {
             ERROR("Invalid operation");
             return -1;
