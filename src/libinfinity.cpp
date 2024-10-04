@@ -132,9 +132,6 @@ int init_rdma_resources(connection_t *conn) {
     conn->local_info.qpn = conn->qp->qp_num;
     conn->local_info.psn = lrand48() & 0xffffff;
     conn->local_info.gid = gid;
-    DEBUG("gid index: {}", gidx);
-    print_rdma_conn_info(&conn->local_info, false);
-    print_rdma_conn_info(&conn->remote_info, true);
     return 0;
 }
 
@@ -261,6 +258,10 @@ int setup_rdma(connection_t *conn) {
         ERROR("Failed to exchange connection information");
         return -1;
     }
+
+    DEBUG("gid index: {}", conn->gidx);
+    print_rdma_conn_info(&conn->local_info, false);
+    print_rdma_conn_info(&conn->remote_info, true);
 
     // Modify QP to RTR state
     if (modify_qp_to_rtr(conn)) {
