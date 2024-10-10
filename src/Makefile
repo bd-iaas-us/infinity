@@ -1,11 +1,20 @@
 CXX = g++
 CXXFLAGS = -std=c++11 -Wall -g
 
+
 INCLUDES = -I/usr/local/cuda/include
 LDFLAGS = -L/usr/local/cuda/lib64
 LIBS = -lcudart -luv -libverbs
-PYBIND11_INCLUDES = $(shell python3 -m pybind11 --includes)
-PYTHON_EXTENSION_SUFFIX = $(shell python3-config --extension-suffix)
+
+
+SITE_PACKAGES = $(shell python3.11 -c "import site; print(site.getsitepackages()[0])")
+#only triton has complete cuda include files
+INCLUDES += -I$(SITE_PACKAGES)/triton/backends/nvidia/include/
+#find cuda runtime lib
+LDFLAGS += -L$(SITE_PACKAGES)/nvidia/cuda_runtime/lib/
+
+PYBIND11_INCLUDES = $(shell python3.11 -m pybind11 --includes)
+PYTHON_EXTENSION_SUFFIX = $(shell python3.11-config --extension-suffix)
 
 PYBIND_TARGET= _infinistore$(PYTHON_EXTENSION_SUFFIX)
 
