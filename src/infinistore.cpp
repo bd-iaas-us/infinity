@@ -53,7 +53,7 @@ const float ON_DEMAND_MIN_THRESHOLD = 0.8;
 const float ON_DEMAND_MAX_THRESHOLD = 0.95;
 
 struct Client {
-    uv_tcp_t *handle_ = NULL;    // uv_stream_t
+    uv_tcp_t handle_;            // uv_stream_t
     read_state_t state_;         // state of the client, for parsing the request
     size_t bytes_read_ = 0;      // bytes read so far, for parsing the request
     size_t expected_bytes_ = 0;  // expected size of the body
@@ -82,11 +82,25 @@ struct Client {
 
     rdma_context rdma_ctx_;
 
+    // poll handle of the rdma completion channel, only initialized after the
+    // rdma exchange is done
     uv_poll_t poll_handle_;
+    bool poll_handle_initialized_ = false;
+
+    // libuv requires the memory of a handle to stay valid until its close callback
+    // has been called. both handles above live inside this client, so the client
+    // must outlive them: close() starts closing every handle it owns and the last
+    // close callback to run deletes the client. see close()/on_handle_closed().
+    bool closing_ = false;
+    int pending_handles_ = 0;
 
     Client() = default;
     Client(const Client &) = delete;
     ~Client();
+
+    // the only way to tear down a client, safe to call more than once
+    void close();
+    void on_handle_closed();
 
     void cq_poll_handle(uv_poll_t *handle, int status, int events);
     int read_rdma_cache(const RemoteMetaRequest *req);
@@ -113,14 +127,9 @@ typedef struct Client client_t;
 Client::~Client() {
     INFO("free client resources");
 
-    if (poll_handle_.data) {
-        uv_poll_stop(&poll_handle_);
-    }
-
-    if (handle_) {
-        free(handle_);
-        handle_ = NULL;
-    }
+    // every handle owned by this client is fully closed at this point, so the
+    // resources they were using(the rdma completion channel below) can be released.
+    assert(pending_handles_ == 0);
 
     if (send_mr_) {
         ibv_dereg_mr(send_mr_);
@@ -155,28 +164,71 @@ Client::~Client() {
         tcp_recv_buffer_ = NULL;
     }
 
+    for (auto &item : outstanding_rdma_ops_queue_) {
+        delete[] item.first;
+        delete[] item.second;
+    }
+
     destroy_rdma_context(&rdma_ctx_);
 }
 
-void on_close(uv_handle_t *handle) {
+void on_handle_closed(uv_handle_t *handle) {
     client_t *client = (client_t *)handle->data;
-    delete client;
+    client->on_handle_closed();
+}
+
+void Client::close() {
+    if (closing_) {
+        // on_read/on_write/on_chunk_write... can all decide to tear down the same
+        // client, and a handle may only be closed once.
+        return;
+    }
+    closing_ = true;
+
+    uv_close((uv_handle_t *)&handle_, ::on_handle_closed);
+    if (poll_handle_initialized_) {
+        uv_close((uv_handle_t *)&poll_handle_, ::on_handle_closed);
+    }
+}
+
+void Client::on_handle_closed() {
+    assert(pending_handles_ > 0);
+    // the client owns the memory of its handles, so it can only go away once the
+    // loop is done with all of them.
+    if (--pending_handles_ == 0) {
+        delete this;
+    }
 }
 
 struct BulkWriteCtx {
-    client_t *client;
-    uint32_t *header_buf;
+    client_t *client;  // weak ptr
+    uint32_t header_buf[2];
     boost::intrusive_ptr<PTR> ptr;
     size_t offset;
     size_t total_size;
+
+    BulkWriteCtx(client_t *client, boost::intrusive_ptr<PTR> ptr)
+        : client(client), ptr(ptr), offset(0), total_size(ptr->size) {
+        header_buf[0] = FINISH;
+        header_buf[1] = static_cast<uint32_t>(ptr->size);
+    }
+    BulkWriteCtx(BulkWriteCtx &) = delete;
+    ~BulkWriteCtx() = default;
 };
 
 void on_chunk_write(uv_write_t *req, int status) {
     BulkWriteCtx *ctx = (BulkWriteCtx *)req->data;
+    uv_handle_t *handle = (uv_handle_t *)req->handle;
+    free(req);
+
+    if (uv_is_closing(handle)) {
+        delete ctx;
+        return;
+    }
+
     if (status < 0) {
         ERROR("Write error {}", uv_strerror(status));
-        uv_close((uv_handle_t *)req->handle, on_close);
-        free(req);
+        ctx->client->close();
         delete ctx;
         return;
     }
@@ -184,7 +236,6 @@ void on_chunk_write(uv_write_t *req, int status) {
     if (ctx->offset == ctx->total_size) {
         DEBUG("write done");
         ctx->client->reset_client_read_state();
-        free(req);
         delete ctx;
         return;
     }
@@ -194,18 +245,23 @@ void on_chunk_write(uv_write_t *req, int status) {
     ctx->offset += send_size;
     uv_write_t *write_req = (uv_write_t *)malloc(sizeof(uv_write_t));
     write_req->data = ctx;
-    uv_write(write_req, (uv_stream_t *)ctx->client->handle_, &buf, 1, on_chunk_write);
-    free(req);
+    uv_write(write_req, (uv_stream_t *)&ctx->client->handle_, &buf, 1, on_chunk_write);
 }
 
 void on_head_write(uv_write_t *req, int status) {
     BulkWriteCtx *ctx = (BulkWriteCtx *)req->data;
+    uv_handle_t *handle = (uv_handle_t *)req->handle;
+    free(req);
+
+    if (uv_is_closing(handle)) {
+        delete ctx;
+        return;
+    }
+
     if (status < 0) {
         ERROR("Write error {}", uv_strerror(status));
-        free(ctx->header_buf);
+        ctx->client->close();
         delete ctx;
-        uv_close((uv_handle_t *)req->handle, on_close);
-        free(req);
         return;
     }
 
@@ -216,8 +272,7 @@ void on_head_write(uv_write_t *req, int status) {
     ctx->offset += send_size;
     uv_write_t *write_req = (uv_write_t *)malloc(sizeof(uv_write_t));
     write_req->data = ctx;
-    uv_write(write_req, (uv_stream_t *)ctx->client->handle_, &buf, 1, on_chunk_write);
-    free(req);
+    uv_write(write_req, (uv_stream_t *)&ctx->client->handle_, &buf, 1, on_chunk_write);
 }
 
 void evict_cache(float min_threshold, float max_threshold) {
@@ -273,22 +328,15 @@ int Client::tcp_payload_request(const TCPPayloadRequest *req) {
             lru_queue.push_back(ptr);
             ptr->lru_it = --lru_queue.end();
 
-            uint32_t *header_buf = (uint32_t *)malloc(sizeof(uint32_t) * 2);
-            header_buf[0] = FINISH;
-            header_buf[1] = static_cast<uint32_t>(ptr->size);
-
             uv_write_t *write_req = (uv_write_t *)malloc(sizeof(uv_write_t));
 
             // safe PTR to prevent it from being deleted early.
-            write_req->data = new BulkWriteCtx{.client = this,
-                                               .header_buf = header_buf,
-                                               .ptr = ptr,
-                                               .offset = 0,
-                                               .total_size = ptr->size};
+            write_req->data = new BulkWriteCtx(this, ptr);
 
-            uv_buf_t buf = uv_buf_init((char *)header_buf, sizeof(uint32_t) * 2);
+            uv_buf_t buf = uv_buf_init((char *)((BulkWriteCtx *)write_req->data)->header_buf,
+                                       sizeof(uint32_t) * 2);
 
-            uv_write(write_req, (uv_stream_t *)handle_, &buf, 1, on_head_write);
+            uv_write(write_req, (uv_stream_t *)&handle_, &buf, 1, on_head_write);
 
             break;
         }
@@ -662,11 +710,16 @@ int verify_header(header_t *header) {
 }
 
 void on_write(uv_write_t *req, int status) {
-    if (status < 0) {
-        ERROR("Write error {}", uv_strerror(status));
-        uv_close((uv_handle_t *)req->handle, on_close);
-    }
+    client_t *client = (client_t *)((uv_handle_t *)req->handle)->data;
     free(req);
+
+    if (status < 0) {
+        // libuv flushes the pending write requests with UV_ECANCELED while the
+        // handle is being closed, so this is also reached during a normal teardown.
+        // Client::close() is idempotent, which makes that harmless.
+        ERROR("Write error {}", uv_strerror(status));
+        client->close();
+    }
 }
 
 int Client::rdma_exchange() {
@@ -738,7 +791,15 @@ int Client::rdma_exchange() {
         return SYSTEM_ERROR;
     }
 
-    uv_poll_init(loop, &poll_handle_, rdma_ctx_.comp_channel->fd);
+    if (uv_poll_init(loop, &poll_handle_, rdma_ctx_.comp_channel->fd) < 0) {
+        ERROR("Failed to init poll handle");
+        return SYSTEM_ERROR;
+    }
+    // the handle is registered in the loop now, from here on it has to be closed
+    // before this client can be deleted.
+    poll_handle_initialized_ = true;
+    pending_handles_++;
+
     poll_handle_.data = this;
     uv_poll_start(&poll_handle_, UV_READABLE | UV_WRITABLE,
                   [](uv_poll_t *handle, int status, int events) {
@@ -765,7 +826,7 @@ void Client::send_resp(int return_code, void *buf, size_t size) {
     memcpy(tcp_send_buffer_ + RETURN_CODE_SIZE, buf, size);
     write_req->data = this;
     uv_buf_t wbuf = uv_buf_init(tcp_send_buffer_, size + RETURN_CODE_SIZE);
-    uv_write(write_req, (uv_stream_t *)handle_, &wbuf, 1, on_write);
+    uv_write(write_req, (uv_stream_t *)&handle_, &wbuf, 1, on_write);
 }
 
 int Client::check_key(const std::string &key_to_check) {
@@ -891,7 +952,7 @@ void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     if (nread < 0) {
         if (nread != UV_EOF)
             ERROR("Read error {}", uv_err_name(nread));
-        uv_close((uv_handle_t *)stream, on_close);
+        client->close();
         goto clean_up;
     }
 
@@ -910,7 +971,7 @@ void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
                     int ret = verify_header(&client->header_);
                     if (ret != 0) {
                         ERROR("Invalid header");
-                        uv_close((uv_handle_t *)stream, on_close);
+                        client->close();
                         goto clean_up;
                     }
                     // prepare for reading body
@@ -970,21 +1031,28 @@ void on_new_connection(uv_stream_t *server, int status) {
         ERROR("New connection error {}", uv_strerror(status));
         return;
     }
-    uv_tcp_t *client_handle = (uv_tcp_t *)malloc(sizeof(uv_tcp_t));
-    uv_tcp_init(loop, client_handle);
-    if (uv_accept(server, (uv_stream_t *)client_handle) == 0) {
-        client_t *client = new client_t();
-        // TODO: use constructor
-        client->handle_ = client_handle;
-        client_handle->data = client;
-        client->state_ = READ_HEADER;
-        client->bytes_read_ = 0;
-        client->expected_bytes_ = FIXED_HEADER_SIZE;
-        uv_read_start((uv_stream_t *)client_handle, alloc_buffer, on_read);
+    client_t *client = new client_t();
+    if (uv_tcp_init(loop, &client->handle_) < 0) {
+        // the handle never made it into the loop, no close callback will come
+        ERROR("Failed to init tcp handle");
+        delete client;
+        return;
     }
-    else {
-        uv_close((uv_handle_t *)client_handle, NULL);
+    // the handle is registered in the loop now, from here on it has to be closed
+    // before this client can be deleted.
+    client->pending_handles_ = 1;
+    client->handle_.data = client;
+
+    if (uv_accept(server, (uv_stream_t *)&client->handle_) != 0) {
+        client->close();
+        return;
     }
+
+    // TODO: use constructor
+    client->state_ = READ_HEADER;
+    client->bytes_read_ = 0;
+    client->expected_bytes_ = FIXED_HEADER_SIZE;
+    uv_read_start((uv_stream_t *)&client->handle_, alloc_buffer, on_read);
 }
 
 int register_server(unsigned long loop_ptr, server_config_t config) {

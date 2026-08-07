@@ -21,9 +21,7 @@ def get_version():
 
         return f"{latest_tag}.{commit_count}"
     except subprocess.CalledProcessError:
-        raise Exception(
-            "Please make sure you have git installed, or you have a tag number"
-        )
+        raise Exception("Please make sure you have git installed and have a tag number")
 
 
 # invoke the make command to build the shared library
